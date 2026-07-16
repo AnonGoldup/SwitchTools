@@ -10,7 +10,7 @@ from libraries.UI.transformer_tab import TransformerTab
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SwitchTools - CEC Electrical Calculators")
+        self.setWindowTitle("SwitchTools - CEC Electrical Calculators v0.1")
         tabs = QTabWidget()
         tabs.addTab(PipeFillTab(), "Pipe Fill")
         tabs.addTab(VoltageDropTab(), "Voltage Drop")
