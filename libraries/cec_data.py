@@ -227,6 +227,53 @@ AMPACITY = {
 }
 
 
+# CEC 2024 Table 16 (Rule 10-616): maximum circuit ampacity / OCP
+# rating, minimum copper size, minimum aluminum size. Sizes use the same
+# AWG/kcmil notation as WIRE_TYPES. Source: published Table 16 transcription
+# at https://www.hongbinli.ca/tools/bonding-size/ (verify local code edition).
+TABLE16_BOND_SIZES = [
+    (20, "14", "12"), (30, "12", "10"), (60, "10", "8"),
+    (100, "8", "6"), (200, "6", "4"), (300, "4", "2"),
+    (400, "3", "1"), (500, "2", "1/0"), (600, "1", "2/0"),
+    (800, "1/0", "3/0"), (1000, "2/0", "4/0"),
+    (1200, "3/0", "250"), (1600, "4/0", "350"),
+    (2000, "250", "400"), (2500, "350", "500"),
+    (3000, "400", "600"), (4000, "500", "800"),
+    (5000, "700", "1000"), (6000, "800", "1250"),
+]
+
+
+def table16_bond_size(amps: float, material: str):
+    """Minimum Table 16 bond size for an ampacity/OCP rating, or None."""
+    if amps <= 0:
+        return None
+    column = {"Copper": 1, "Aluminum": 2}[material]
+    for row in TABLE16_BOND_SIZES:
+        if amps <= row[0]:
+            return row[column]
+    return None
+
+
+def automatic_bond(counts: dict, material: str, temp: int, bond_material: str):
+    """Return (bond size, sizing ampacity), or None when no wires are selected.
+
+    With no OCP input, use the largest individual conductor's unadjusted
+    Table 2/4 ampacity at the selected temperature. This is not a parallel-set
+    or voltage-drop sizing calculation. Never silently omit an unknown size.
+    """
+    selected = [size for size, count in counts.items() if count > 0]
+    if not selected:
+        return None
+    table = AMPACITY[material][temp]
+    if any(size not in table for size in selected):
+        raise ValueError("No ampacity data for a selected conductor/material.")
+    amps = max(table[size] for size in selected)
+    size = table16_bond_size(amps, bond_material)
+    if size is None:
+        raise ValueError("Required bond is outside CEC Table 16 data.")
+    return size, amps
+
+
 def table5c_derating_factor(conductor_count: int) -> float:
     """CEC Table 5C ampacity correction for conductor count in a raceway."""
     if conductor_count <= 3:

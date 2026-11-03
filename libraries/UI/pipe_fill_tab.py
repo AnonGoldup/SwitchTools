@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QComboBox, QLineEdit, QLabel, QSpinBox, QScrollArea, QPushButton,
     QGroupBox, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QSizePolicy,
+    QAbstractItemView, QSizePolicy, QCheckBox,
 )
 
 from libraries import cec_data
@@ -174,6 +174,28 @@ class PipeFillTab(QWidget):
         amp_row.addStretch()
         form.addRow("Ampacity basis:", amp_row)
 
+        bond_row = QHBoxLayout()
+        self.add_bond_check = QCheckBox("Add Bond Conductor")
+        self.add_bond_check.setChecked(True)
+        self.bond_material_combo = QComboBox()
+        self.bond_material_combo.addItems(["Copper", "Aluminum"])
+        bond_tip = (
+            "CEC Table 16: automatic sizing uses the largest selected conductor's "
+            "base ampacity at the chosen ampacity basis (not the sum of quantities). "
+            "The bond uses the selected wire insulation for fill and is excluded "
+            "from Table 5C derating. Verify actual OCP, parallel circuits and "
+            "local code requirements separately."
+        )
+        self.add_bond_check.setToolTip(bond_tip)
+        self.bond_material_combo.setToolTip(bond_tip)
+        self.add_bond_check.toggled.connect(self.bond_material_combo.setEnabled)
+        self.add_bond_check.toggled.connect(self._recalculate)
+        self.bond_material_combo.currentIndexChanged.connect(self._recalculate)
+        bond_row.addWidget(self.add_bond_check)
+        bond_row.addWidget(self.bond_material_combo)
+        bond_row.addStretch()
+        form.addRow(bond_row)
+
         layout.addWidget(settings_box)
 
         # --- wire counts ----------------------------------------------------
@@ -208,6 +230,7 @@ class PipeFillTab(QWidget):
         rform = QFormLayout(results_box)
 
         self.total_label = QLabel("-")
+        self.total_label.setWordWrap(True)
         rform.addRow("Conductors:", self.total_label)
 
         self.limit_result_label = QLabel("-")
@@ -351,7 +374,7 @@ class PipeFillTab(QWidget):
 
     def _fill_finished(self):
         # cap a typed limit at the Table 8 maximum once the user is done typing
-        table8 = cec_data.table8_max_fill_percent(self._read_counts()[1])
+        table8 = cec_data.table8_max_fill_percent(self._read_fill()[1])
         if _resolve_limit(self._limit_overridden, self.max_fill_edit.text(),
                           table8)[1]:
             self._use_table8()
@@ -424,8 +447,36 @@ class PipeFillTab(QWidget):
         total_area = sum(n * table[s] for s, n in counts.items())
         return counts, sum(counts.values()), total_area
 
-    def _recalculate(self):
+    def _read_fill(self):
+        """Include one automatic bond in fill only, never in current counts."""
         counts, total_count, total_area = self._read_counts()
+        bond_text = ""
+        error = ""
+        if counts and self.add_bond_check.isChecked():
+            try:
+                material = self.bond_material_combo.currentText()
+                size, amps = cec_data.automatic_bond(
+                    counts, self.material_combo.currentText(),
+                    int(self.temp_combo.currentText()), material
+                )
+                wire_type = self.wire_combo.currentText()
+                area = cec_data.WIRE_TYPES[wire_type].get(size)
+                if area is None:
+                    raise ValueError("No fill-area data for the required bond size.")
+                total_count += 1
+                total_area += area
+                bond_text = (
+                    f"Bond: 1 {TIMES} {cec_data.wire_size_label(size)} {material}, "
+                    f"{wire_type}\n"
+                    f"CEC Table 16 basis: largest conductor {amps:g} A "
+                    "(before derating; verify actual OCP)."
+                )
+            except ValueError as exc:
+                error = f"Cannot size automatic bond: {exc}"
+        return counts, total_count, total_area, bond_text, error
+
+    def _recalculate(self):
+        counts, total_count, total_area, bond_text, bond_error = self._read_fill()
         table8 = cec_data.table8_max_fill_percent(total_count)
         limit, capped = _resolve_limit(
             self._limit_overridden, self.max_fill_edit.text(), table8
@@ -436,7 +487,7 @@ class PipeFillTab(QWidget):
             self._limit_overridden = False
             capped = False
         self._update_limit_controls(table8, total_count, capped)
-        self._update_derating(counts, total_count)
+        self._update_derating(counts, sum(counts.values()))
 
         conduit_name = self.conduit_combo.currentText()
         is_custom = conduit_name == cec_data.CUSTOM_CONDUIT
@@ -452,7 +503,15 @@ class PipeFillTab(QWidget):
             self._show("-", "-", None, "")
             return
 
-        self.total_label.setText(f"{total_count}, total {total_area:.1f} mm²")
+        if bond_error:
+            self.total_label.setText(bond_error)
+            self.limit_result_label.setText("-")
+            self._show("-", "-", "unchecked", "Choose a supported conductor/material "
+                       "or disable automatic bonding to calculate fill without a bond.")
+            return
+
+        summary = f"{total_count}, total {total_area:.1f} mm²"
+        self.total_label.setText(f"{summary}\n{bond_text}" if bond_text else summary)
         n_text = _plural(total_count, "conductor")
 
         if limit is None:
