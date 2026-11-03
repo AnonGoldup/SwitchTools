@@ -3,24 +3,109 @@ with Table 5C ampacity derating for conductor count."""
 
 import math
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
     QComboBox, QLineEdit, QLabel, QSpinBox, QScrollArea, QPushButton,
     QGroupBox, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView,
+    QAbstractItemView, QSizePolicy,
 )
 
 from libraries import cec_data
+
+FIND_SMALLEST = "Find the smallest size"
+
+BADGES = {
+    "ok": ("Within limit", "#1f7a1f"),
+    "over": ("Over limit", "#b42318"),
+    "unchecked": ("Not checked", "#6b7280"),
+}
+WARN_COLOR = BADGES["over"][1]
+TIMES = chr(0xD7)
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _positive_float(text: str):
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _resolve_limit(overridden: bool, typed: str, table8: int):
+    """Return (limit, capped). A typed limit above Table 8 is capped at it;
+    limit is None if the typed text is not a valid number."""
+    if not overridden:
+        return float(table8), False
+    value = _positive_float(typed)
+    if value is None:
+        return None, False
+    if table8 and value > table8:
+        return float(table8), True
+    return value, False
+
+
+def _short_type(conduit_name: str) -> str:
+    """'EMT (electrical metallic tubing)' -> 'EMT'"""
+    return conduit_name.split(" (")[0]
+
+
+def _size_text(conduit_name: str, metric: str) -> str:
+    area = cec_data.CONDUIT_TYPES[conduit_name][metric]
+    return (f"{cec_data.TRADE_SIZE_LABELS[metric]} {_short_type(conduit_name)}, "
+            f"{area:,.0f} mm² inside")
+
+
+def _smaller_size_note(conduit_name, metric, total_area, limit) -> str:
+    """Why the next size down doesn't work ('' if already the smallest)."""
+    areas = cec_data.CONDUIT_TYPES[conduit_name]
+    sizes = list(areas)
+    idx = sizes.index(metric)
+    if idx == 0:
+        return ""
+    smaller = sizes[idx - 1]
+    pct = cec_data.fill_percent(total_area, areas[smaller])
+    return (f"One size smaller, {cec_data.TRADE_SIZE_LABELS[smaller]}, "
+            f"would be {pct:.1f}% full, over the {limit:g}% limit.")
+
+
+class CountSpinBox(QSpinBox):
+    """Spin box that reads 0 when its text is cleared, instead of keeping the
+    last value (which would still be counted in the results)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # QSpinBox.textChanged only fires when the value changes
+        self.lineEdit().textChanged.connect(self._text_changed)
+
+    def _text_changed(self, text: str):
+        if not text.strip():
+            self.setValue(0)
+            self.lineEdit().selectAll()  # so the next digit replaces the 0
 
 
 class PipeFillTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._spinboxes = {}  # wire size -> QSpinBox
+        self._limit_overridden = False
         self._build_ui()
+        self._rebuild_size_combo()
         self._rebuild_wire_grid()
         self._recalculate()
+
+    def minimumSizeHint(self):
+        # the word-wrapped result labels make the layout height-for-width,
+        # which Qt leaves out of the minimum size; without this the window
+        # can be shrunk until the sections overlap
+        hint = super().minimumSizeHint()
+        return hint.expandedTo(
+            QSize(hint.width(), self.layout().heightForWidth(hint.width()))
+        )
 
     # ------------------------------------------------------------------ UI
 
@@ -45,22 +130,34 @@ class PipeFillTab(QWidget):
         self.custom_id_label.hide()
         self.custom_id_edit.hide()
 
+        self.size_combo = QComboBox()
+        self.size_combo.currentIndexChanged.connect(self._recalculate)
+        self.size_label = QLabel("Conduit size:")
+        form.addRow(self.size_label, self.size_combo)
+
         self.wire_combo = QComboBox()
         self.wire_combo.addItems(list(cec_data.WIRE_TYPES.keys()))
         self.wire_combo.currentIndexChanged.connect(self._wire_type_changed)
         form.addRow("Wire type:", self.wire_combo)
 
         fill_row = QHBoxLayout()
-        self.max_fill_edit = QLineEdit("40")
+        self.max_fill_edit = QLineEdit()
         self.max_fill_edit.setFixedWidth(70)
-        self.max_fill_edit.textChanged.connect(self._recalculate)
+        self.max_fill_edit.setPlaceholderText("auto")
+        # textEdited (not textChanged) so setting the Table 8 value in code
+        # doesn't count as the user overriding it
+        self.max_fill_edit.textEdited.connect(self._fill_edited)
+        self.max_fill_edit.editingFinished.connect(self._fill_finished)
         fill_row.addWidget(self.max_fill_edit)
         fill_row.addWidget(QLabel("%"))
-        self.table8_hint = QLabel("")
-        self.table8_hint.setStyleSheet("color: gray;")
-        fill_row.addWidget(self.table8_hint)
+        self.limit_hint = QLabel("")
+        fill_row.addWidget(self.limit_hint)
+        self.use_table8_btn = QPushButton("Use Table 8")
+        self.use_table8_btn.clicked.connect(self._use_table8)
+        self.use_table8_btn.hide()
+        fill_row.addWidget(self.use_table8_btn)
         fill_row.addStretch()
-        form.addRow("Maximum fill:", fill_row)
+        form.addRow("Fill limit:", fill_row)
 
         amp_row = QHBoxLayout()
         self.material_combo = QComboBox()
@@ -70,7 +167,7 @@ class PipeFillTab(QWidget):
         amp_row.addWidget(QLabel("at"))
         self.temp_combo = QComboBox()
         self.temp_combo.addItems(["60", "75", "90"])
-        self.temp_combo.setCurrentText("90")
+        self.temp_combo.setCurrentText("75")  # most terminations are rated 75 °C
         self.temp_combo.currentIndexChanged.connect(self._recalculate)
         amp_row.addWidget(self.temp_combo)
         amp_row.addWidget(QLabel("°C termination/insulation"))
@@ -86,9 +183,14 @@ class PipeFillTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.grid_scroll = scroll
         self.grid_host = QWidget()
         self.wire_grid = QGridLayout(self.grid_host)
-        self.wire_grid.setContentsMargins(4, 4, 4, 4)
+        self.wire_grid.setContentsMargins(10, 8, 10, 8)
+        self.wire_grid.setHorizontalSpacing(10)
+        self.wire_grid.setVerticalSpacing(6)
         scroll.setWidget(self.grid_host)
         counts_layout.addWidget(scroll)
 
@@ -99,25 +201,42 @@ class PipeFillTab(QWidget):
         clear_row.addWidget(clear_btn)
         counts_layout.addLayout(clear_row)
 
-        layout.addWidget(counts_box, stretch=1)
+        layout.addWidget(counts_box)
 
         # --- results --------------------------------------------------------
         results_box = QGroupBox("Results")
         rform = QFormLayout(results_box)
 
         self.total_label = QLabel("-")
-        rform.addRow("Total conductors / area:", self.total_label)
+        rform.addRow("Conductors:", self.total_label)
 
+        self.limit_result_label = QLabel("-")
+        self.limit_result_label.setWordWrap(True)
+        rform.addRow("Fill limit:", self.limit_result_label)
+
+        big = self.total_label.font()
+        big.setBold(True)
+        big.setPointSize(big.pointSize() + 2)
+
+        self.conduit_row_label = QLabel("Minimum conduit size:")
         self.required_label = QLabel("-")
-        f = self.required_label.font()
-        f.setBold(True)
-        f.setPointSize(f.pointSize() + 2)
-        self.required_label.setFont(f)
-        rform.addRow("Required conduit:", self.required_label)
+        self.required_label.setFont(big)
+        rform.addRow(self.conduit_row_label, self.required_label)
 
+        fill_result_row = QHBoxLayout()
         self.fill_label = QLabel("-")
-        self.fill_label.setFont(f)
-        rform.addRow("Fill:", self.fill_label)
+        self.fill_label.setFont(big)
+        fill_result_row.addWidget(self.fill_label)
+        self.badge = QLabel("")
+        self.badge.hide()
+        fill_result_row.addWidget(self.badge)
+        fill_result_row.addStretch()
+        rform.addRow("Fill:", fill_result_row)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        self.detail_row_label = QLabel("")
+        rform.addRow(self.detail_row_label, self.detail_label)
 
         self.derate_label = QLabel("-")
         rform.addRow("Derating (CEC Table 5C):", self.derate_label)
@@ -140,6 +259,21 @@ class PipeFillTab(QWidget):
         rform.addRow(self.derate_table)
 
         layout.addWidget(results_box)
+        layout.addStretch(1)
+
+    def _rebuild_size_combo(self):
+        """List the sizes for the current conduit type, keeping the selected
+        size if the new type has it."""
+        previous = self.size_combo.currentData()
+        self.size_combo.blockSignals(True)
+        self.size_combo.clear()
+        self.size_combo.addItem(FIND_SMALLEST, None)
+        name = self.conduit_combo.currentText()
+        for metric in cec_data.CONDUIT_TYPES.get(name, {}):
+            self.size_combo.addItem(cec_data.TRADE_SIZE_LABELS[metric], metric)
+        idx = self.size_combo.findData(previous) if previous else 0
+        self.size_combo.setCurrentIndex(max(idx, 0))
+        self.size_combo.blockSignals(False)
 
     def _rebuild_wire_grid(self):
         """Rebuild the size/quantity grid for the selected wire type,
@@ -160,16 +294,29 @@ class PipeFillTab(QWidget):
         for i, size in enumerate(sizes):
             col, row = divmod(i, rows)
             label = QLabel(cec_data.wire_size_label(size))
-            spin = QSpinBox()
+            spin = CountSpinBox()
             spin.setRange(0, 999)
             spin.setValue(previous.get(size, 0))
+            # sized for a 3-digit count rather than stretched across the column
+            spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            spin.setMinimumWidth(80)
             spin.valueChanged.connect(self._recalculate)
             self._spinboxes[size] = spin
             self.wire_grid.addWidget(label, row, col * 3)
             self.wire_grid.addWidget(spin, row, col * 3 + 1)
-        for col in range(columns):
-            self.wire_grid.setColumnMinimumWidth(col * 3 + 2, 30)
+            # added to a visible parent they'd stay hidden until the next event
+            # loop pass, and be left out of the size hint below
+            label.show()
+            spin.show()
+        # each label sits next to its box; spare width is split between the
+        # gaps, so the first group lines up left and the last lines up right
+        for col in range(columns - 1):
+            self.wire_grid.setColumnMinimumWidth(col * 3 + 2, 28)
+            self.wire_grid.setColumnStretch(col * 3 + 2, 1)
         self.wire_grid.setRowStretch(rows, 1)
+        # never smaller than the grid, so no size is cut off and the window
+        # can't be shrunk past it
+        self.grid_scroll.setMinimumSize(self.grid_host.sizeHint())
 
     # ------------------------------------------------------------- handlers
 
@@ -177,15 +324,40 @@ class PipeFillTab(QWidget):
         is_custom = self.conduit_combo.currentText() == cec_data.CUSTOM_CONDUIT
         self.custom_id_label.setVisible(is_custom)
         self.custom_id_edit.setVisible(is_custom)
+        self.size_label.setVisible(not is_custom)
+        self.size_combo.setVisible(not is_custom)
+        self._rebuild_size_combo()
         self._recalculate()
 
     def _wire_type_changed(self):
         default_temp = cec_data.WIRE_TYPE_TEMP_DEFAULT.get(
             self.wire_combo.currentText()
         )
-        if default_temp is not None:
+        current_temp = int(self.temp_combo.currentText())
+        if default_temp is not None and current_temp > default_temp:
+            # the insulation rating caps the column (e.g. TW75 can't use 90 °C).
+            # signals blocked so the old grid isn't recalculated against the
+            # new wire table
+            self.temp_combo.blockSignals(True)
             self.temp_combo.setCurrentText(str(default_temp))
+            self.temp_combo.blockSignals(False)
         self._rebuild_wire_grid()
+        self._recalculate()
+
+    def _fill_edited(self, text: str):
+        # an empty box goes back to the Table 8 value
+        self._limit_overridden = bool(text.strip())
+        self._recalculate()
+
+    def _fill_finished(self):
+        # cap a typed limit at the Table 8 maximum once the user is done typing
+        table8 = cec_data.table8_max_fill_percent(self._read_counts()[1])
+        if _resolve_limit(self._limit_overridden, self.max_fill_edit.text(),
+                          table8)[1]:
+            self._use_table8()
+
+    def _use_table8(self):
+        self._limit_overridden = False
         self._recalculate()
 
     def _clear_counts(self):
@@ -195,98 +367,168 @@ class PipeFillTab(QWidget):
             sb.blockSignals(False)
         self._recalculate()
 
-    # ---------------------------------------------------------- calculation
+    # -------------------------------------------------------------- display
 
-    def _recalculate(self):
-        table = cec_data.WIRE_TYPES[self.wire_combo.currentText()]
-        counts = {}
-        total_area = 0.0
-        total_count = 0
-        for size, sb in self._spinboxes.items():
-            n = sb.value()
-            if n:
-                counts[size] = n
-                total_count += n
-                total_area += n * table[size]
+    def _set_badge(self, kind):
+        if kind is None:
+            self.badge.hide()
+            return
+        text, color = BADGES[kind]
+        self.badge.setText(text)
+        self.badge.setStyleSheet(
+            f"background-color: {color}; color: white; font-weight: bold;"
+            "border-radius: 9px; padding: 2px 10px;"
+        )
+        self.badge.show()
 
-        hint = cec_data.table8_max_fill_percent(total_count)
-        self.table8_hint.setText(
-            f"(CEC Table 8 allows {hint}% for {total_count} conductor"
-            f"{'s' if total_count != 1 else ''})" if total_count else ""
+    def _show(self, conduit_text, fill_text, badge, detail):
+        self.required_label.setText(conduit_text)
+        self.fill_label.setText(fill_text)
+        self._set_badge(badge)
+        self.detail_label.setText(detail)
+        self.detail_row_label.setText("Why:" if detail else "")
+
+    def _set_hint(self, text, warn=False):
+        self.limit_hint.setText(text)
+        self.limit_hint.setStyleSheet(
+            f"color: {WARN_COLOR}; font-weight: bold;" if warn else "color: gray;"
         )
 
+    def _update_limit_controls(self, table8, total_count, capped):
+        n_text = _plural(total_count, "conductor")
+        if not self._limit_overridden:
+            self.max_fill_edit.setText(str(table8) if total_count else "")
+            self._set_hint(f"(CEC Table 8 maximum for {n_text})" if total_count
+                           else "(set by CEC Table 8 once you add conductors)")
+            self.use_table8_btn.hide()
+            return
+
+        self.use_table8_btn.setText(
+            f"Use {table8}%" if total_count else "Use Table 8"
+        )
+        self.use_table8_btn.show()
+        if capped:
+            self._set_hint(
+                f"The CEC Table 8 maximum is {table8}% for {n_text}.", warn=True
+            )
+        else:
+            self._set_hint(f"(your limit; the CEC Table 8 maximum is {table8}%)"
+                           if total_count else "(your limit)")
+
+    # ---------------------------------------------------------- calculation
+
+    def _read_counts(self):
+        """Return (counts by size, total count, total area in mm²)."""
+        table = cec_data.WIRE_TYPES[self.wire_combo.currentText()]
+        counts = {s: sb.value() for s, sb in self._spinboxes.items() if sb.value()}
+        total_area = sum(n * table[s] for s, n in counts.items())
+        return counts, sum(counts.values()), total_area
+
+    def _recalculate(self):
+        counts, total_count, total_area = self._read_counts()
+        table8 = cec_data.table8_max_fill_percent(total_count)
+        limit, capped = _resolve_limit(
+            self._limit_overridden, self.max_fill_edit.text(), table8
+        )
+        if capped and not self.max_fill_edit.hasFocus():
+            # conductor count changed and the maximum dropped below the
+            # typed limit, so reset the box to the maximum
+            self._limit_overridden = False
+            capped = False
+        self._update_limit_controls(table8, total_count, capped)
         self._update_derating(counts, total_count)
+
+        conduit_name = self.conduit_combo.currentText()
+        is_custom = conduit_name == cec_data.CUSTOM_CONDUIT
+        chosen = self.size_combo.currentData()  # None in find mode and for custom
+        find_mode = not is_custom and chosen is None
+        self.conduit_row_label.setText(
+            "Minimum conduit size:" if find_mode else "Conduit size:"
+        )
 
         if total_count == 0:
             self.total_label.setText("-")
-            self.required_label.setText("-")
-            self.fill_label.setText("-")
+            self.limit_result_label.setText("-")
+            self._show("-", "-", None, "")
             return
 
-        self.total_label.setText(f"{total_count} conductors, {total_area:.1f} mm²")
+        self.total_label.setText(f"{total_count}, total {total_area:.1f} mm²")
+        n_text = _plural(total_count, "conductor")
 
-        try:
-            max_fill = float(self.max_fill_edit.text())
-            if not 0 < max_fill <= 100:
-                raise ValueError
-        except ValueError:
-            self.required_label.setText("Enter a valid max fill % (0-100)")
-            self.fill_label.setText("-")
+        if limit is None:
+            self.limit_result_label.setText("Enter a fill limit as a number")
+            self._show("-", "-", "unchecked", "")
             return
 
-        conduit_name = self.conduit_combo.currentText()
-        if conduit_name == cec_data.CUSTOM_CONDUIT:
-            self._recalculate_custom(total_area, max_fill)
+        own_limit = self._limit_overridden and not capped
+        if capped:
+            self.limit_result_label.setText(
+                f"{table8}% (capped at the CEC Table 8 maximum for {n_text})"
+            )
+        elif own_limit:
+            self.limit_result_label.setText(
+                f"{limit:g}% (your limit; the CEC Table 8 maximum is {table8}% "
+                f"for {n_text})"
+            )
+        else:
+            self.limit_result_label.setText(
+                f"{table8}% (CEC Table 8 maximum for {n_text})"
+            )
+
+        pipe = self._pipe_to_check(conduit_name, is_custom, chosen,
+                                   total_area, limit)
+        if pipe is None:
+            self._show("Enter the custom internal diameter (mm)", "-", None, "")
             return
+        label, area, metric = pipe
+        fill = cec_data.fill_percent(total_area, area)
+        if fill <= limit:
+            badge = "ok"
+            detail = (_smaller_size_note(conduit_name, metric, total_area, limit)
+                      if find_mode else "")
+        else:
+            badge = "over"
+            source = "your limit" if own_limit else "CEC Table 8"
+            detail = self._over_limit_note(conduit_name, is_custom, find_mode,
+                                           total_area, limit, n_text, source)
+        self._show(label, f"{fill:.1f}%", badge, detail)
+
+    def _pipe_to_check(self, conduit_name, is_custom, chosen, total_area, limit):
+        """Return (label, internal area, trade size) for the pipe being checked,
+        or None if the custom diameter is missing. In find mode this is the
+        smallest size that fits, or the largest size if none do."""
+        if is_custom:
+            dia = _positive_float(self.custom_id_edit.text())
+            if dia is None:
+                return None
+            area = math.pi / 4.0 * dia * dia
+            return f"Custom Ø{dia:g} mm, {area:,.1f} mm² inside", area, None
 
         areas = cec_data.CONDUIT_TYPES[conduit_name]
-        for metric, area in areas.items():
-            if total_area <= area * max_fill / 100.0:
-                fill_pct = total_area / area * 100.0
-                self.required_label.setText(
-                    f"{cec_data.TRADE_SIZE_LABELS[metric]}  -  {area:.0f} mm² internal"
-                )
-                self.fill_label.setText(
-                    f"{fill_pct:.1f}%  (limit {max_fill:.0f}% = "
-                    f"{area * max_fill / 100.0:.1f} mm²)"
-                )
-                self.fill_label.setStyleSheet("color: #2e8b2e;")
-                return
+        if chosen is None:
+            fit = cec_data.min_conduit_size(conduit_name, total_area, limit)
+            if fit is None:
+                largest = list(areas)[-1]
+                label = (f"Does not fit in the largest size, "
+                         f"{cec_data.TRADE_SIZE_LABELS[largest]} "
+                         f"{_short_type(conduit_name)}")
+                return label, areas[largest], largest
+            chosen = fit[0]
+        return _size_text(conduit_name, chosen), areas[chosen], chosen
 
-        largest = list(areas)[-1]
-        area = areas[largest]
-        self.required_label.setText(
-            f"Does not fit in largest size ({cec_data.TRADE_SIZE_LABELS[largest]}) - "
-            "split into multiple runs"
-        )
-        self.fill_label.setText(
-            f"{total_area / area * 100.0:.1f}% in {cec_data.TRADE_SIZE_LABELS[largest]}"
-        )
-        self.fill_label.setStyleSheet("color: #cc3333;")
-
-    def _recalculate_custom(self, total_area: float, max_fill: float):
-        try:
-            dia = float(self.custom_id_edit.text())
-            if dia <= 0:
-                raise ValueError
-        except ValueError:
-            self.required_label.setText("Enter the custom internal diameter (mm)")
-            self.fill_label.setText("-")
-            return
-
-        area = math.pi / 4.0 * dia * dia
-        fill_pct = total_area / area * 100.0
-        ok = fill_pct <= max_fill
-        self.required_label.setText(
-            f"Custom conduit Ø{dia:g} mm  -  {area:.1f} mm² internal"
-        )
-        self.fill_label.setText(
-            f"{fill_pct:.1f}% - {'OK' if ok else 'OVERFILLED'} "
-            f"(limit {max_fill:.0f}%)"
-        )
-        self.fill_label.setStyleSheet(
-            "color: #2e8b2e;" if ok else "color: #cc3333;"
-        )
+    def _over_limit_note(self, conduit_name, is_custom, find_mode, total_area,
+                         limit, n_text, source):
+        if find_mode:
+            return "Split the run into more than one conduit."
+        rule = f"{n_text.capitalize()} may fill {limit:g}% at most ({source})."
+        if is_custom:
+            return f"{rule} Use a larger pipe or split the run."
+        fit = cec_data.min_conduit_size(conduit_name, total_area, limit)
+        if fit is None:
+            return (f"{rule} It does not fit in the largest size either. "
+                    "Split the run.")
+        size = cec_data.TRADE_SIZE_LABELS[fit[0]]
+        return f"{rule} Use {size} or larger, or split the run."
 
     def _update_derating(self, counts: dict, total_count: int):
         """Per-size ampacity after the CEC Table 5C count correction."""
@@ -297,7 +539,7 @@ class PipeFillTab(QWidget):
 
         factor = cec_data.table5c_derating_factor(total_count)
         self.derate_label.setText(
-            f"{total_count} current-carrying conductors → ×{factor:.2f} "
+            f"{total_count} current-carrying conductors → {TIMES}{factor:.2f} "
             f"({factor * 100:.0f}%)"
         )
 

@@ -16,4 +16,4 @@ class MainWindow(QMainWindow):
         tabs.addTab(VoltageDropTab(), "Voltage Drop")
         tabs.addTab(TransformerTab(), "Transformers")
         self.setCentralWidget(tabs)
-        self.resize(880, 780)
+        self.resize(self.sizeHint())  # open at the size the tabs need

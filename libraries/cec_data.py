@@ -253,6 +253,23 @@ def min_conductor_size(required_amps: float, material: str, temp: int):
     return None
 
 
+def fill_percent(total_area: float, inside_area: float) -> float:
+    """Conductor area as a percentage of a raceway's internal area."""
+    return total_area / inside_area * 100.0
+
+
+def min_conduit_size(conduit_name: str, total_area: float, max_fill_pct: float):
+    """Smallest trade size of this conduit type whose fill stays within
+    max_fill_pct.
+
+    Returns (metric designator, internal area) or None if nothing is large enough.
+    """
+    for metric, area in CONDUIT_TYPES[conduit_name].items():
+        if fill_percent(total_area, area) <= max_fill_pct:
+            return metric, area
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Standard overcurrent device ratings (CEC Rule 14-010 / Table 13 range)
 # ---------------------------------------------------------------------------
