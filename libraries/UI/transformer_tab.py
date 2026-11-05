@@ -1,10 +1,14 @@
 """Transformer sizing tab - CEC Rules 26-250s.
 
 - Primary/secondary full-load current from kVA and voltages
-- Conductors at 125% of rated current (Rules 26-256 / 26-258)
-- Primary OCP: max 125% (Rule 26-252, next standard size permitted when
-  rated current >= 9 A); up to 300% when the secondary has its own OCP
-  at <= 125% (Rule 26-254)
+- Conductors at 125% of rated current (Rule 26-256), and never smaller than
+  the breaker that protects them (Rule 14-104, including the 14-104(2)
+  small-conductor limits)
+- Primary OCP: max 125%, next standard size permitted (Rule 26-254(1)/(3));
+  up to 300% when the secondary has its own OCP at <= 125%, which rounds
+  down (Rule 26-254(2))
+- Without secondary OCP, the secondary conductors are protected by the
+  primary breaker through the voltage ratio (Rule 26-256(4))
 """
 
 import math
@@ -81,7 +85,7 @@ class TransformerTab(QWidget):
         self.pri_wire_label.setFont(bold)
         pform.addRow("Conductor (125%, Rule 26-256):", self.pri_wire_label)
         self.pri_brk_min_label = QLabel("-")
-        pform.addRow("Breaker - minimum recommended:", self.pri_brk_min_label)
+        pform.addRow("Breaker - recommended:", self.pri_brk_min_label)
         self.pri_brk_max_label = QLabel("-")
         pform.addRow("Breaker - maximum permitted:", self.pri_brk_max_label)
         layout.addWidget(primary_box)
@@ -94,15 +98,17 @@ class TransformerTab(QWidget):
         sform.addRow("Full-load current:", self.sec_fla_label)
         self.sec_wire_label = QLabel("-")
         self.sec_wire_label.setFont(bold)
-        sform.addRow("Conductor (125%, Rule 26-258):", self.sec_wire_label)
+        self.sec_wire_label.setWordWrap(True)
+        sform.addRow("Conductor (Rule 26-256):", self.sec_wire_label)
         self.sec_brk_label = QLabel("-")
         sform.addRow("Breaker (≤ 125%):", self.sec_brk_label)
         layout.addWidget(secondary_box)
 
         note = QLabel(
-            "Dry-type transformer rules, 750 V or less. Verify the conductor "
-            "ampacity against the chosen OCP rating (Rule 14-104), and check "
-            "Table 5C derating if more than 3 conductors share a raceway."
+            "Dry-type transformer rules, 750 V or less. Conductors are sized "
+            "for the recommended breaker; a larger breaker needs larger "
+            "conductors (Rule 14-104). Check Table 5C derating if more than "
+            "3 conductors share a raceway."
         )
         note.setStyleSheet("color: gray;")
         note.setWordWrap(True)
@@ -132,10 +138,12 @@ class TransformerTab(QWidget):
                     self.sec_brk_label):
             lbl.setText("-")
 
-    def _wire_text(self, required_amps: float) -> str:
+    def _wire_text(self, required_amps: float, ocp) -> str:
+        """Smallest conductor carrying required_amps that may also sit on an
+        ocp-amp breaker (Rule 14-104(2))."""
         material = self.material_combo.currentText()
         temp = int(self.temp_combo.currentText())
-        result = cec_data.min_conductor_size(required_amps, material, temp)
+        result = cec_data.min_conductor_size(required_amps, material, temp, ocp)
         if result is None:
             return (f"needs {required_amps:.1f} A - parallel runs required")
         size, amp = result
@@ -159,44 +167,55 @@ class TransformerTab(QWidget):
         self.pri_fla_label.setText(f"{ip:.1f} A")
         self.sec_fla_label.setText(f"{i_sec:.1f} A")
 
-        # conductors at 125%
-        self.pri_wire_label.setText(self._wire_text(1.25 * ip))
-        self.sec_wire_label.setText(self._wire_text(1.25 * i_sec))
-
-        # primary OCP
         pri_125 = 1.25 * ip
-        min_brk = cec_data.next_standard_ocp(pri_125)
-        if ip < 9:
-            # no round-up allowance below 9 A: stay at or below 125%
-            max_no_sec = cec_data.largest_standard_ocp_at_or_below(pri_125)
+        sec_125 = 1.25 * i_sec
+        secondary_ocp = self.secondary_ocp_check.isChecked()
+
+        # primary OCP: the most Rule 26-254 permits
+        if secondary_ocp:
+            max_brk = cec_data.largest_standard_ocp_at_or_below(3.0 * ip)
+            max_text = (f"300% of {ip:.1f} A = {3.0 * ip:.1f} A, "
+                        "Rule 26-254(2) with secondary OCP")
+        elif ip >= 9:
+            max_brk = cec_data.next_standard_ocp(pri_125)
+            max_text = "next standard size above 125% permitted, Rule 26-254(3)"
         else:
-            max_no_sec = min_brk
-        self.pri_brk_min_label.setText(
-            f"{min_brk} A  (125% of {ip:.1f} A = {pri_125:.1f} A)"
-            if min_brk else f"125% = {pri_125:.1f} A - beyond standard ratings"
+            # kept at or below 125% for small primary currents
+            max_brk = cec_data.largest_standard_ocp_at_or_below(pri_125)
+            max_text = "kept at or below 125% (rated current under 9 A)"
+        self.pri_brk_max_label.setText(
+            f"{max_brk} A  ({max_text})" if max_brk
+            else f"125% = {pri_125:.1f} A - below 15 A, use a suitably rated fuse"
         )
 
-        if self.secondary_ocp_check.isChecked():
-            max_brk = cec_data.largest_standard_ocp_at_or_below(3.0 * ip)
-            self.pri_brk_max_label.setText(
-                f"{max_brk} A  (300% of {ip:.1f} A = {3.0 * ip:.1f} A, "
-                "Rule 26-254 with secondary OCP)"
-                if max_brk else "below 15 A - use a suitably rated fuse"
-            )
-            sec_125 = 1.25 * i_sec
-            sec_brk = cec_data.next_standard_ocp(sec_125)
+        # recommended: the smallest standard size at or above 125%, within
+        # the maximum
+        next_up = cec_data.next_standard_ocp(pri_125)
+        brk = min(next_up, max_brk) if next_up and max_brk else max_brk
+        self.pri_brk_min_label.setText(
+            f"{brk} A  (125% of {ip:.1f} A = {pri_125:.1f} A)" if brk
+            else "below 15 A - use a suitably rated fuse"
+        )
+
+        # primary conductors are protected by the recommended breaker
+        self.pri_wire_label.setText(self._wire_text(max(pri_125, brk or 0), brk))
+
+        if secondary_ocp:
+            # the secondary device must not exceed 125%, so it rounds down
+            sec_brk = cec_data.largest_standard_ocp_at_or_below(sec_125)
             self.sec_brk_label.setText(
-                f"{sec_brk} A  (125% of {i_sec:.1f} A = {sec_125:.1f} A)"
-                if sec_brk else f"125% = {sec_125:.1f} A - beyond standard ratings"
+                f"{sec_brk} A  (largest standard size at or below 125% of "
+                f"{i_sec:.1f} A = {sec_125:.1f} A, Rule 26-254(2))" if sec_brk
+                else f"125% = {sec_125:.1f} A - below 15 A, use a fuse"
             )
+            self.sec_wire_label.setText(self._wire_text(sec_125, sec_brk))
         else:
-            if max_no_sec:
-                suffix = ("next standard above 125% permitted, Rule 26-252"
-                          if ip >= 9 else
-                          "must not exceed 125% (rated current < 9 A)")
-                self.pri_brk_max_label.setText(f"{max_no_sec} A  ({suffix})")
-            else:
-                self.pri_brk_max_label.setText(
-                    f"125% = {pri_125:.1f} A - below 15 A, use a fuse"
-                )
+            # no secondary device: the primary breaker protects the secondary
+            # conductors through the voltage ratio (Rule 26-256(4))
             self.sec_brk_label.setText("not selected")
+            reflected = brk * vp / vs if brk else 0.0
+            text = self._wire_text(max(sec_125, reflected), reflected or None)
+            if reflected > sec_125:
+                text += (f", for the {brk} A primary breaker seen through "
+                         f"the {vp:g}/{vs:g} V ratio")
+            self.sec_wire_label.setText(text)

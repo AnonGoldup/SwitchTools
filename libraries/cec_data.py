@@ -287,16 +287,30 @@ def table5c_derating_factor(conductor_count: int) -> float:
     return 0.50
 
 
-def min_conductor_size(required_amps: float, material: str, temp: int):
-    """Smallest conductor with ampacity >= required_amps.
+# Rule 14-104(2): largest overcurrent device permitted on small conductors,
+# whatever their table ampacity
+SMALL_CONDUCTOR_MAX_OCP = {
+    "Copper": {"14": 15, "12": 20, "10": 30},
+    "Aluminum": {"12": 15},
+}
+
+
+def min_conductor_size(required_amps: float, material: str, temp: int,
+                       ocp: float = None):
+    """Smallest conductor with ampacity >= required_amps. With ocp given, also
+    skips sizes that Rule 14-104(2) doesn't allow on a device that large.
 
     Returns (size, ampacity) or None if nothing is large enough.
     """
     table = AMPACITY[material][temp]
+    caps = SMALL_CONDUCTOR_MAX_OCP[material]
     for size in WIRE_SIZE_ORDER:
         amp = table.get(size)
-        if amp is not None and amp >= required_amps:
-            return size, amp
+        if amp is None or amp < required_amps:
+            continue
+        if ocp is not None and caps.get(size, ocp) < ocp:
+            continue
+        return size, amp
     return None
 
 

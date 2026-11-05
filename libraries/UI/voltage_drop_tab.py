@@ -1,4 +1,5 @@
-"""Voltage drop calculator tab - CEC Rule 8-102 (3% branch / 5% total)."""
+"""Voltage drop calculator tab - CEC Rule 8-102 (3% per feeder or branch
+circuit / 5% total from the consumer's service)."""
 
 import math
 
@@ -32,13 +33,13 @@ class VoltageDropTab(QWidget):
 
         self.phase_combo = QComboBox()
         self.phase_combo.addItems([
-            "Single-phase (2-wire)",
-            "Three-phase (3-wire / 4-wire)",
+            "Single-phase or line-to-neutral (2-wire)",
+            "Three-phase (line-to-line)",
         ])
         form.addRow("Phase:", self.phase_combo)
 
         self.current_edit = QLineEdit()
-        self.current_edit.setPlaceholderText("Load current, A")
+        self.current_edit.setPlaceholderText("Connected load, A")
         form.addRow("Load current (A):", self.current_edit)
 
         length_row = QHBoxLayout()
@@ -60,13 +61,21 @@ class VoltageDropTab(QWidget):
 
         self.parallel_spin = QSpinBox()
         self.parallel_spin.setRange(1, 20)
+        # QSpinBox keeps its last value when the text is cleared
+        self.parallel_spin.lineEdit().textChanged.connect(self._parallel_edited)
         form.addRow("Parallel sets:", self.parallel_spin)
 
         self.limit_edit = QLineEdit("3")
         form.addRow("Max voltage drop (%):", self.limit_edit)
 
-        hint = QLabel("CEC 8-102: max 3% for a branch circuit, 5% feeder + branch combined.")
+        hint = QLabel(
+            "CEC 8-102: max 3% in any feeder or branch circuit, and 5% total "
+            "from the supply side of the consumer's service to the load. Use "
+            "the connected load, or 80% of the breaker rating if the load "
+            "isn't known."
+        )
         hint.setStyleSheet("color: gray;")
+        hint.setWordWrap(True)
         form.addRow(hint)
 
         layout.addWidget(inputs_box)
@@ -94,6 +103,14 @@ class VoltageDropTab(QWidget):
         self.max_len_label = QLabel("-")
         rform.addRow("Max length at limit (this size):", self.max_len_label)
 
+        dc_note = QLabel(
+            "Uses DC resistance at 75 °C. For 1/0 and larger, especially in "
+            "steel conduit, the actual drop is higher."
+        )
+        dc_note.setStyleSheet("color: gray;")
+        dc_note.setWordWrap(True)
+        rform.addRow(dc_note)
+
         layout.addWidget(results_box)
         layout.addStretch()
 
@@ -117,6 +134,12 @@ class VoltageDropTab(QWidget):
             self.size_combo.setCurrentIndex(idx)
         self.size_combo.blockSignals(False)
         self._recalculate()
+
+    def _parallel_edited(self, text: str):
+        # an emptied box means one set, not the last number typed
+        if not text.strip():
+            self.parallel_spin.setValue(self.parallel_spin.minimum())
+            self.parallel_spin.lineEdit().selectAll()
 
     # ---------------------------------------------------------- calculation
 
