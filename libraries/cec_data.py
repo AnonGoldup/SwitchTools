@@ -291,7 +291,7 @@ def table5c_derating_factor(conductor_count: int) -> float:
 # whatever their table ampacity
 SMALL_CONDUCTOR_MAX_OCP = {
     "Copper": {"14": 15, "12": 20, "10": 30},
-    "Aluminum": {"12": 15},
+    "Aluminum": {"12": 15, "10": 25},
 }
 
 

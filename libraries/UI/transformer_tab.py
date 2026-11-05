@@ -7,8 +7,9 @@
 - Primary OCP: max 125%, next standard size permitted (Rule 26-254(1)/(3));
   up to 300% when the secondary has its own OCP at <= 125%, which rounds
   down (Rule 26-254(2))
-- Without secondary OCP, the secondary conductors are protected by the
-  primary breaker through the voltage ratio (Rule 26-256(4))
+- A primary breaker at or below 125% protects secondary conductors rated at
+  125% or more (Rule 26-254(1)); above 125%, the secondary conductors must
+  be protected by it through the voltage ratio (Rule 26-256(4))
 """
 
 import math
@@ -176,16 +177,13 @@ class TransformerTab(QWidget):
             max_brk = cec_data.largest_standard_ocp_at_or_below(3.0 * ip)
             max_text = (f"300% of {ip:.1f} A = {3.0 * ip:.1f} A, "
                         "Rule 26-254(2) with secondary OCP")
-        elif ip >= 9:
+        else:
+            # unlike Rule 26-252, the dry-type rule has no 9 A threshold
             max_brk = cec_data.next_standard_ocp(pri_125)
             max_text = "next standard size above 125% permitted, Rule 26-254(3)"
-        else:
-            # kept at or below 125% for small primary currents
-            max_brk = cec_data.largest_standard_ocp_at_or_below(pri_125)
-            max_text = "kept at or below 125% (rated current under 9 A)"
         self.pri_brk_max_label.setText(
             f"{max_brk} A  ({max_text})" if max_brk
-            else f"125% = {pri_125:.1f} A - below 15 A, use a suitably rated fuse"
+            else "no standard breaker rating fits - use a suitably rated fuse"
         )
 
         # recommended: the smallest standard size at or above 125%, within
@@ -210,10 +208,12 @@ class TransformerTab(QWidget):
             )
             self.sec_wire_label.setText(self._wire_text(sec_125, sec_brk))
         else:
-            # no secondary device: the primary breaker protects the secondary
-            # conductors through the voltage ratio (Rule 26-256(4))
+            # no secondary device: a primary breaker at or below 125% protects
+            # secondary conductors rated at 125% or more (Rule 26-254(1)); a
+            # rounded-up one must protect them through the voltage ratio
+            # (Rule 26-256(4))
             self.sec_brk_label.setText("not selected")
-            reflected = brk * vp / vs if brk else 0.0
+            reflected = brk * vp / vs if brk and brk > pri_125 else 0.0
             text = self._wire_text(max(sec_125, reflected), reflected or None)
             if reflected > sec_125:
                 text += (f", for the {brk} A primary breaker seen through "
